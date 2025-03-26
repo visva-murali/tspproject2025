@@ -1,10 +1,11 @@
-def exhaustive_search_tsp(signal_timing, max_extension=5):
+def exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5):
     """
     Perform an exhaustive search that tests applying TSP at every possible second
-    of the traffic signal cycle to find optimal timing plans.
+    of the traffic signal cycle to find optimal timing plans for a fixed bus arrival time.
     
     Parameters:
     signal_timing (list): A list of dictionaries representing the signal timing plan.
+    arrival_time (int): The fixed arrival time of the bus in seconds.
     max_extension (int): The maximum extension for TSP (in seconds).
     
     Returns:
@@ -20,90 +21,53 @@ def exhaustive_search_tsp(signal_timing, max_extension=5):
     baseline_plan = {
         'plan': signal_timing.copy(),
         'type': 'No TSP',
-        'bus_arrival_time': None,
         'insertion_point': None,
         'extension': None,
-        'bus_delay': None,
-        'person_delay': None
+        'bus_delay': calculate_bus_delay(signal_timing, arrival_time),
+        'person_delay': calculate_person_delay(signal_timing, arrival_time)
     }
     tsp_plans.append(baseline_plan)
     
-    # For each possible bus arrival time in the cycle
-    for arrival_time in range(int(cycle_length)):
-        # Get the current phase, remaining time, and status based on arrival time
-        phase_info = find_bus_phase(arrival_time, signal_timing)
+    # Get the current phase, remaining time, and status based on arrival time
+    phase_info = find_bus_phase(arrival_time, signal_timing)
+    
+    # Skip if arrival time is outside the cycle
+    if isinstance(phase_info, str):
+        return tsp_plans
         
-        # Skip if arrival time is outside the cycle
-        if isinstance(phase_info, str):
+    phase_name, remaining_time, status = phase_info
+    
+    # For each possible insertion point in the cycle
+    for insertion_second in range(int(cycle_length)):
+        # Determine which phase contains this second
+        insertion_phase_info = find_insertion_phase(insertion_second, signal_timing)
+        
+        if insertion_phase_info is None:
             continue
-            
-        phase_name, remaining_time, status = phase_info
+        
+        insertion_phase_index, time_within_phase = insertion_phase_info
         
         # Create a copy of the original signal timing plan
         modified_plan = [phase.copy() for phase in signal_timing]
         
-        # Determine which TSP strategy to use based on the phase
-        tsp_strategy = check_tsp_need(phase_name, remaining_time)
+        # Apply TSP at this insertion point
+        tsp_modified_plan = apply_tsp_at_time(
+            modified_plan, 
+            insertion_phase_index, 
+            time_within_phase, 
+            max_extension
+        )
         
-        # Apply the appropriate TSP strategy
-        if tsp_strategy == "Bus arrives during green, no adjustments needed":
-            # No TSP needed
-            tsp_modified_plan = modified_plan
-            tsp_type = "No TSP Needed"
-            extension = 0
-        elif tsp_strategy == "Green Extension TSP is needed":
-            # Apply green extension
-            tsp_modified_plan = apply_green_extension(modified_plan, phase_name, max_extension)
-            tsp_type = "Green Extension"
-            extension = max_extension
-        else:  # "Red TSP strategy is needed"
-            # For each possible insertion point in the cycle
-            for insertion_second in range(int(cycle_length)):
-                # Determine which phase contains this second
-                insertion_phase_info = find_insertion_phase(insertion_second, signal_timing)
-                
-                if insertion_phase_info is None:
-                    continue
-                
-                insertion_phase_index, time_within_phase = insertion_phase_info
-                
-                # Apply TSP at this insertion point
-                tsp_modified_plan = apply_tsp_at_time(
-                    modified_plan.copy(), 
-                    insertion_phase_index, 
-                    time_within_phase, 
-                    max_extension
-                )
-                
-                # Calculate performance metrics for this plan
-                bus_delay = calculate_bus_delay(tsp_modified_plan, arrival_time)
-                person_delay = calculate_person_delay(tsp_modified_plan, arrival_time)
-                
-                # Add this plan to our list
-                tsp_plans.append({
-                    'plan': tsp_modified_plan,
-                    'type': "Red TSP",
-                    'bus_arrival_time': arrival_time,
-                    'insertion_point': insertion_second,
-                    'extension': max_extension,
-                    'bus_delay': bus_delay,
-                    'person_delay': person_delay
-                })
-            
-            # Skip the rest of this iteration since we've already added all insertion plans
-            continue
-        
-        # Calculate performance metrics for green extension or no TSP plans
+        # Calculate performance metrics for this plan
         bus_delay = calculate_bus_delay(tsp_modified_plan, arrival_time)
         person_delay = calculate_person_delay(tsp_modified_plan, arrival_time)
         
         # Add this plan to our list
         tsp_plans.append({
             'plan': tsp_modified_plan,
-            'type': tsp_type,
-            'bus_arrival_time': arrival_time,
-            'insertion_point': None,  # For green extension, there's no insertion point
-            'extension': extension,
+            'type': "TSP Insertion",
+            'insertion_point': insertion_second,
+            'extension': max_extension,
             'bus_delay': bus_delay,
             'person_delay': person_delay
         })
@@ -157,24 +121,6 @@ def find_bus_phase(arrival_time, signal_timing):
     # If the arrival time is outside the full cycle, return a message indicating it's not valid
     return "Arrival time is outside the full cycle."
 
-def check_tsp_need(phase, remaining_time):
-    """
-    Determine if TSP is needed based on the phase and remaining time.
-
-    Parameters:
-    phase (str): The phase name.
-    remaining_time (float): The remaining time in the phase when the bus arrives.
-
-    Returns:
-    str: A message indicating if TSP is needed.
-    """
-    if 'North-South Through' in phase and 'Yellow' not in phase and 'Red Clearance' not in phase:
-        return "Bus arrives during green, no adjustments needed"
-    elif 'North-South Through Yellow' in phase:
-        return "Green Extension TSP is needed"
-    else:
-        return "Red TSP strategy is needed."
-
 def find_insertion_phase(insertion_second, signal_timing):
     """
     Determine which phase contains the specified insertion second.
@@ -196,38 +142,6 @@ def find_insertion_phase(insertion_second, signal_timing):
         cumulative_time += phase['duration']
     
     return None
-
-def apply_green_extension(signal_plan, phase_name, extension):
-    """
-    Apply green extension TSP strategy.
-    
-    Parameters:
-    signal_plan (list): Signal timing plan.
-    phase_name (str): The name of the phase to extend.
-    extension (int): Duration of TSP extension.
-    
-    Returns:
-    list: Modified signal plan with green extension applied.
-    """
-    modified_plan = [phase.copy() for phase in signal_plan]
-    
-    # Find the phase to extend
-    ns_through_index = next((i for i, phase in enumerate(modified_plan) 
-                           if phase['phase'] == 'North-South Through'), None)
-    
-    # Find a competing phase to reduce time from
-    ew_through_index = next((i for i, phase in enumerate(modified_plan) 
-                           if phase['phase'] == 'East-West Through'), None)
-    
-    if ns_through_index is not None and ew_through_index is not None:
-        # Extend the North-South Through phase
-        modified_plan[ns_through_index]['duration'] += extension
-        
-        # Reduce time from the East-West Through phase to maintain cycle length
-        if modified_plan[ew_through_index]['duration'] - extension >= 5:  # Minimum green time
-            modified_plan[ew_through_index]['duration'] -= extension
-    
-    return modified_plan
 
 def apply_tsp_at_time(signal_plan, phase_index, time_in_phase, extension):
     """
@@ -349,7 +263,6 @@ def calculate_bus_delay(timing_plan, bus_arrival_time, bus_speed=40, stop_distan
     
     return 0  # Default case
 
-
 def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30, cars_per_cycle=40, passengers_per_car=1.5):
     """
     Calculate the person delay for all traffic users with the given timing plan.
@@ -384,8 +297,8 @@ def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30,
     
     # Calculate delay for cars in each direction
     # Assume car distribution is proportional to green time allocation
-    ns_car_ratio = ns_green_time / (ns_green_time + ew_green_time)
-    ew_car_ratio = ew_green_time / (ns_green_time + ew_green_time)
+    ns_car_ratio = ns_green_time / (ns_green_time + ew_green_time) if (ns_green_time + ew_green_time) > 0 else 0.5
+    ew_car_ratio = ew_green_time / (ns_green_time + ew_green_time) if (ns_green_time + ew_green_time) > 0 else 0.5
     
     ns_cars = cars_per_cycle * ns_car_ratio
     ew_cars = cars_per_cycle * ew_car_ratio
@@ -404,6 +317,24 @@ def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30,
     
     return total_person_delay
 
+def check_tsp_need(phase, remaining_time):
+    """
+    Determine if TSP is needed based on the phase and remaining time.
+
+    Parameters:
+    phase (str): The phase name.
+    remaining_time (float): The remaining time in the phase when the bus arrives.
+
+    Returns:
+    str: A message indicating if TSP is needed.
+    """
+    if 'North-South Through' in phase and 'Yellow' not in phase and 'Red Clearance' not in phase:
+        return "Bus arrives during green, no adjustments needed"
+    elif 'North-South Through Yellow' in phase:
+        return "Green Extension TSP is needed"
+    else:
+        return "Red TSP strategy is needed."
+
 if __name__ == "__main__":
     # Use your existing signal timing plan
     signal_timing = [
@@ -421,55 +352,91 @@ if __name__ == "__main__":
         {'phase': 'East-West Left Red Clearance', 'duration': 1.2},
     ]
     
+    # Fixed bus arrival time for the exhaustive search
+    arrival_time = 85  # This is the fixed arrival time from your original code
+    
+    # Get details about when the bus will arrive at the intersection
+    phase_info = find_bus_phase(arrival_time, signal_timing)
+    if not isinstance(phase_info, str):
+        phase_name, remaining_time, status = phase_info
+        print(f"The bus will arrive at the {phase_name} phase with {remaining_time} seconds left ({status}).")
+        
+        # Check if TSP is needed
+        tsp_message = check_tsp_need(phase_name, remaining_time)
+        print(tsp_message)
+    
     # Run the exhaustive search
-    tsp_plans = exhaustive_search_tsp(signal_timing, max_extension=5)
+    tsp_plans = exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5)
     
-    # Group plans by bus arrival time
-    arrival_times = sorted(set(plan['bus_arrival_time'] for plan in tsp_plans if plan['bus_arrival_time'] is not None))
-    
-    # Display plans organized by bus arrival time
-    print("Exhaustive TSP Search Results:")
+    # Display the results
+    print("\nExhaustive TSP Search Results:")
     print("=" * 80)
     
-    print("\nBaseline (No TSP):")
+    # Display baseline (no TSP) plan
     baseline = next(plan for plan in tsp_plans if plan['type'] == 'No TSP')
-    print(f"Person delay: {baseline['person_delay']} seconds")
+    print("\nBaseline (No TSP):")
+    print(f"Bus delay: {baseline['bus_delay']:.1f} seconds")
+    print(f"Person delay: {baseline['person_delay']:.1f} seconds")
     
-    for arrival_time in arrival_times:
-        # Find the best plan for this arrival time
-        best_plan = None
-        min_bus_delay = float('inf')
+    # Display top 10 plans
+    print("\nTop 10 TSP plans by bus delay:")
+    for i, plan in enumerate(tsp_plans[:10]):
+        if i == 0 and plan['type'] == 'No TSP':
+            # Skip the baseline plan in the top 10 if it's already the best
+            continue
+            
+        print("\n" + "-" * 80)
+        print(f"Plan {i+1}:")
+        print(f"Type: {plan['type']}")
         
-        for plan in tsp_plans:
-            if plan['bus_arrival_time'] == arrival_time and plan['bus_delay'] is not None:
-                if plan['bus_delay'] < min_bus_delay:
-                    min_bus_delay = plan['bus_delay']
-                    best_plan = plan
+        if plan['insertion_point'] is not None:
+            # Find which phase the insertion point is in
+            insertion_phase_info = find_insertion_phase(plan['insertion_point'], signal_timing)
+            if insertion_phase_info:
+                insertion_phase_index, time_within_phase = insertion_phase_info
+                insertion_phase = signal_timing[insertion_phase_index]['phase']
+                print(f"TSP inserted during: {insertion_phase}")
+                print(f"Insertion at second: {plan['insertion_point']} (within phase: {time_within_phase:.1f}s)")
         
-        if best_plan:
-            # Get the phase information for this arrival time
-            phase_info = find_bus_phase(arrival_time, signal_timing)
-            if isinstance(phase_info, str):
-                continue
-            phase_name, remaining_time, status = phase_info
-            
-            print("\n" + "-" * 80)
-            print(f"Bus arrival time: {arrival_time} seconds")
-            print(f"Bus arrives at: {phase_name} phase with {remaining_time:.1f} seconds remaining ({status})")
-            print(f"Best TSP strategy: {best_plan['type']}")
-            
-            if best_plan['insertion_point'] is not None:
-                print(f"TSP insertion at: {best_plan['insertion_point']} seconds")
-            
-            print(f"Extension: {best_plan['extension']} seconds")
-            print(f"Bus delay: {best_plan['bus_delay']:.1f} seconds")
-            print(f"Person delay: {best_plan['person_delay']:.1f} seconds")
-            
-            # Calculate improvement percentages
-            if baseline['bus_delay'] is not None and baseline['bus_delay'] > 0:
-                bus_improvement = (baseline['bus_delay'] - best_plan['bus_delay']) / baseline['bus_delay'] * 100
-                print(f"Bus delay improvement: {bus_improvement:.1f}%")
-            
-            if baseline['person_delay'] is not None and baseline['person_delay'] > 0:
-                person_improvement = (baseline['person_delay'] - best_plan['person_delay']) / baseline['person_delay'] * 100
-                print(f"Person delay improvement: {person_improvement:.1f}%")
+        print(f"Extension: {plan['extension']} seconds")
+        print(f"Bus delay: {plan['bus_delay']:.1f} seconds")
+        print(f"Person delay: {plan['person_delay']:.1f} seconds")
+        
+        # Calculate improvement percentages
+        if baseline['bus_delay'] > 0:
+            bus_improvement = (baseline['bus_delay'] - plan['bus_delay']) / baseline['bus_delay'] * 100
+            print(f"Bus delay improvement: {bus_improvement:.1f}%")
+        
+        if baseline['person_delay'] > 0:
+            person_improvement = (baseline['person_delay'] - plan['person_delay']) / baseline['person_delay'] * 100
+            print(f"Person delay improvement: {person_improvement:.1f}%")
+    
+    # Find and display the best plan that minimizes person delay
+    min_person_delay = min(plan['person_delay'] for plan in tsp_plans if plan['person_delay'] is not None)
+    best_person_plan = next(plan for plan in tsp_plans if plan['person_delay'] == min_person_delay)
+    
+    print("\n" + "=" * 80)
+    print("Best plan for minimizing total person delay:")
+    print(f"Type: {best_person_plan['type']}")
+    
+    if best_person_plan['insertion_point'] is not None:
+        # Find which phase the insertion point is in
+        insertion_phase_info = find_insertion_phase(best_person_plan['insertion_point'], signal_timing)
+        if insertion_phase_info:
+            insertion_phase_index, time_within_phase = insertion_phase_info
+            insertion_phase = signal_timing[insertion_phase_index]['phase']
+            print(f"TSP inserted during: {insertion_phase}")
+            print(f"Insertion at second: {best_person_plan['insertion_point']} (within phase: {time_within_phase:.1f}s)")
+    
+    print(f"Extension: {best_person_plan['extension']} seconds")
+    print(f"Bus delay: {best_person_plan['bus_delay']:.1f} seconds")
+    print(f"Person delay: {best_person_plan['person_delay']:.1f} seconds")
+    
+    # Calculate improvement percentages
+    if baseline['bus_delay'] > 0 and best_person_plan['bus_delay'] is not None:
+        bus_improvement = (baseline['bus_delay'] - best_person_plan['bus_delay']) / baseline['bus_delay'] * 100
+        print(f"Bus delay improvement: {bus_improvement:.1f}%")
+    
+    if baseline['person_delay'] > 0:
+        person_improvement = (baseline['person_delay'] - best_person_plan['person_delay']) / baseline['person_delay'] * 100
+        print(f"Person delay improvement: {person_improvement:.1f}%")
