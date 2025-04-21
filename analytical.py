@@ -1,4 +1,4 @@
-def exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5):
+def exhaustive_search_tsp(signal_timing, arrival_time, current_time=0, max_extension=5, optimization_horizon=200, avg_arrivals=None):
     """
     Perform an exhaustive search that tests applying TSP at every possible second
     of the traffic signal cycle to find optimal timing plans for a fixed bus arrival time.
@@ -6,30 +6,54 @@ def exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5):
     Parameters:
     signal_timing (list): A list of dictionaries representing the signal timing plan.
     arrival_time (int): The fixed arrival time of the bus in seconds.
+    current_time (int): Current simulation time in seconds.
     max_extension (int): The maximum extension for TSP (in seconds).
+    optimization_horizon (int): Time horizon for optimization in seconds.
+    avg_arrivals (dict): Average vehicle arrivals per second for each direction.
     
     Returns:
     list: A list of modified signal timing plans with performance metrics.
     """
+    # Set default average arrivals if not provided
+    if avg_arrivals is None:
+        avg_arrivals = {
+            'north_south': 0.3,  # vehicles per second
+            'east_west': 0.25    # vehicles per second
+        }
+        
     # Calculate total cycle length
     cycle_length = sum(phase['duration'] for phase in signal_timing)
+    
+    # Adjust arrival time based on current time
+    adjusted_arrival_time = arrival_time - current_time if arrival_time >= current_time else arrival_time
+    
+    # Determine current position in the signal timing plan based on current_time
+    current_phase_info = get_current_phase(current_time, signal_timing)
+    if current_phase_info is None:
+        current_phase_index, time_elapsed_in_phase = 0, 0
+    else:
+        current_phase_index, time_elapsed_in_phase = current_phase_info
+    
+    # Create a modified signal timing plan starting from current_time
+    current_signal_timing = create_signal_plan_from_current_time(signal_timing, current_phase_index, time_elapsed_in_phase, optimization_horizon)
     
     # List to store all possible TSP timing plans
     tsp_plans = []
     
     # First, add a baseline "no TSP" plan
     baseline_plan = {
-        'plan': signal_timing.copy(),
+        'plan': current_signal_timing.copy(),
         'type': 'No TSP',
         'insertion_point': None,
         'extension': None,
-        'bus_delay': calculate_bus_delay(signal_timing, arrival_time),
-        'person_delay': calculate_person_delay(signal_timing, arrival_time)
+        'bus_delay': calculate_bus_delay(current_signal_timing, adjusted_arrival_time),
+        'person_delay': calculate_person_delay(current_signal_timing, adjusted_arrival_time, avg_arrivals=avg_arrivals),
+        'detailed_timing': generate_detailed_timing_plan(current_signal_timing, optimization_horizon)
     }
     tsp_plans.append(baseline_plan)
     
     # Get the current phase, remaining time, and status based on arrival time
-    phase_info = find_bus_phase(arrival_time, signal_timing)
+    phase_info = find_bus_phase(adjusted_arrival_time, current_signal_timing)
     
     # Skip if arrival time is outside the cycle
     if isinstance(phase_info, str):
@@ -38,38 +62,51 @@ def exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5):
     phase_name, remaining_time, status = phase_info
     
     # For each possible insertion point in the cycle
-    for insertion_second in range(int(cycle_length)):
+    for insertion_second in range(min(int(cycle_length), optimization_horizon)):
         # Determine which phase contains this second
-        insertion_phase_info = find_insertion_phase(insertion_second, signal_timing)
+        insertion_phase_info = find_insertion_phase(insertion_second, current_signal_timing)
         
         if insertion_phase_info is None:
             continue
         
         insertion_phase_index, time_within_phase = insertion_phase_info
         
-        # Create a copy of the original signal timing plan
-        modified_plan = [phase.copy() for phase in signal_timing]
+        # Create a copy of the current signal timing plan
+        modified_plan = [phase.copy() for phase in current_signal_timing]
+        
+        # Determine if we need dynamic extension (5 or 7 seconds)
+        dynamic_extension = determine_dynamic_extension(
+            modified_plan,
+            insertion_phase_index,
+            phase_name,
+            status,
+            avg_arrivals
+        )
         
         # Apply TSP at this insertion point
         tsp_modified_plan = apply_tsp_at_time(
             modified_plan, 
             insertion_phase_index, 
             time_within_phase, 
-            max_extension
+            dynamic_extension
         )
         
         # Calculate performance metrics for this plan
-        bus_delay = calculate_bus_delay(tsp_modified_plan, arrival_time)
-        person_delay = calculate_person_delay(tsp_modified_plan, arrival_time)
+        bus_delay = calculate_bus_delay(tsp_modified_plan, adjusted_arrival_time)
+        person_delay = calculate_person_delay(tsp_modified_plan, adjusted_arrival_time, avg_arrivals=avg_arrivals)
+        
+        # Generate detailed timing plan
+        detailed_timing = generate_detailed_timing_plan(tsp_modified_plan, optimization_horizon)
         
         # Add this plan to our list
         tsp_plans.append({
             'plan': tsp_modified_plan,
             'type': "TSP Insertion",
             'insertion_point': insertion_second,
-            'extension': max_extension,
+            'extension': dynamic_extension,
             'bus_delay': bus_delay,
-            'person_delay': person_delay
+            'person_delay': person_delay,
+            'detailed_timing': detailed_timing
         })
     
     # Sort plans by bus delay (primary) and person delay (secondary)
@@ -79,6 +116,186 @@ def exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5):
     ))
     
     return tsp_plans
+
+def determine_dynamic_extension(timing_plan, phase_index, bus_phase, status, avg_arrivals):
+    """
+    Determine whether to use 5 or 7 seconds for TSP extension based on conditions.
+    
+    Parameters:
+    timing_plan (list): Signal timing plan.
+    phase_index (int): Index of the insertion phase.
+    bus_phase (str): The phase name where the bus will arrive.
+    status (str): The phase status (Green, Yellow, Red).
+    avg_arrivals (dict): Average vehicle arrivals per second.
+    
+    Returns:
+    int: 5 or 7 seconds for TSP extension.
+    """
+    # Default extension is 5 seconds
+    extension = 5
+    
+    # Check if we need a 7-second extension
+    # Condition: Red phase AND more than 3 vehicles in queue
+    if 'North-South' not in bus_phase or status == 'Red Clearance' or 'Yellow' in bus_phase:
+        # Calculate queue length for North-South direction
+        queue_length = estimate_queue_length(timing_plan, 'north_south', avg_arrivals)
+        
+        # If more than 3 vehicles are waiting, use 7-second extension
+        if queue_length > 3:
+            extension = 7
+    
+    return extension
+
+def estimate_queue_length(timing_plan, direction, avg_arrivals):
+    """
+    Estimate the number of vehicles in queue for a specific direction.
+    
+    Parameters:
+    timing_plan (list): Signal timing plan.
+    direction (str): Traffic direction ('north_south' or 'east_west').
+    avg_arrivals (dict): Average vehicle arrivals per second.
+    
+    Returns:
+    float: Estimated number of vehicles in queue.
+    """
+    # Get cycle length
+    cycle_length = sum(phase['duration'] for phase in timing_plan)
+    
+    # Calculate red time for the direction
+    if direction == 'north_south':
+        red_time = sum(phase['duration'] for phase in timing_plan 
+                       if "North-South" not in phase['phase'] or 
+                       "Yellow" in phase['phase'] or 
+                       "Red Clearance" in phase['phase'])
+    else:  # east_west
+        red_time = sum(phase['duration'] for phase in timing_plan 
+                       if "East-West" not in phase['phase'] or 
+                       "Yellow" in phase['phase'] or 
+                       "Red Clearance" in phase['phase'])
+    
+    # Estimate queue based on average arrivals during red time
+    queue_length = red_time * avg_arrivals[direction]
+    
+    return queue_length
+
+def get_current_phase(current_time, signal_timing):
+    """
+    Determine the current phase and elapsed time within that phase based on current time.
+    
+    Parameters:
+    current_time (float): Current simulation time in seconds.
+    signal_timing (list): A list of dictionaries representing the signal timing plan.
+    
+    Returns:
+    tuple or None: A tuple containing the phase index and time elapsed in phase,
+                  or None if current_time is outside the cycle.
+    """
+    cycle_length = sum(phase['duration'] for phase in signal_timing)
+    
+    # Normalize current_time to within the cycle
+    normalized_time = current_time % cycle_length
+    
+    # Find the current phase
+    cumulative_time = 0
+    for i, phase in enumerate(signal_timing):
+        phase_end = cumulative_time + phase['duration']
+        if cumulative_time <= normalized_time < phase_end:
+            time_elapsed = normalized_time - cumulative_time
+            return (i, time_elapsed)
+        cumulative_time = phase_end
+    
+    return None
+
+def create_signal_plan_from_current_time(signal_timing, current_phase_index, time_elapsed_in_phase, horizon):
+    """
+    Create a signal timing plan starting from the current time and extending to the specified horizon.
+    
+    Parameters:
+    signal_timing (list): Original signal timing plan.
+    current_phase_index (int): Index of current phase.
+    time_elapsed_in_phase (float): Time elapsed in current phase.
+    horizon (int): Time horizon for the new plan in seconds.
+    
+    Returns:
+    list: Modified signal timing plan starting from current time.
+    """
+    new_plan = []
+    
+    # Add the current phase with remaining time
+    current_phase = signal_timing[current_phase_index].copy()
+    remaining_time = current_phase['duration'] - time_elapsed_in_phase
+    current_phase['duration'] = remaining_time
+    new_plan.append(current_phase)
+    
+    # Add subsequent phases until we reach the horizon
+    total_time = remaining_time
+    phase_index = (current_phase_index + 1) % len(signal_timing)
+    
+    while total_time < horizon:
+        next_phase = signal_timing[phase_index].copy()
+        new_plan.append(next_phase)
+        total_time += next_phase['duration']
+        phase_index = (phase_index + 1) % len(signal_timing)
+    
+    return new_plan
+
+def generate_detailed_timing_plan(signal_timing, horizon):
+    """
+    Generate a detailed second-by-second signal timing plan.
+    
+    Parameters:
+    signal_timing (list): Signal timing plan.
+    horizon (int): Time horizon in seconds.
+    
+    Returns:
+    dict: Detailed timing plan with second-by-second phase information.
+    """
+    detailed_plan = {
+        'seconds': [],
+        'north_south': [],
+        'east_west': []
+    }
+    
+    # Generate second-by-second phase information
+    current_second = 0
+    cumulative_time = 0
+    
+    for phase in signal_timing:
+        phase_duration = phase['duration']
+        phase_end = cumulative_time + phase_duration
+        
+        # Determine phase status for each direction
+        ns_status = "RED"
+        ew_status = "RED"
+        
+        if "North-South" in phase['phase']:
+            if "Yellow" in phase['phase']:
+                ns_status = "YELLOW"
+            elif "Red Clearance" in phase['phase']:
+                ns_status = "RED"
+            else:
+                ns_status = "GREEN"
+        elif "East-West" in phase['phase']:
+            if "Yellow" in phase['phase']:
+                ew_status = "YELLOW"
+            elif "Red Clearance" in phase['phase']:
+                ew_status = "RED"
+            else:
+                ew_status = "GREEN"
+        
+        # Add each second in this phase to the detailed plan
+        while cumulative_time < phase_end and current_second < horizon:
+            detailed_plan['seconds'].append(current_second)
+            detailed_plan['north_south'].append(ns_status)
+            detailed_plan['east_west'].append(ew_status)
+            
+            current_second += 1
+            cumulative_time += 1
+        
+        if current_second >= horizon:
+            break
+    
+    return detailed_plan
 
 def find_bus_phase(arrival_time, signal_timing):
     """
@@ -263,7 +480,7 @@ def calculate_bus_delay(timing_plan, bus_arrival_time, bus_speed=40, stop_distan
     
     return 0  # Default case
 
-def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30, cars_per_cycle=40, passengers_per_car=1.5):
+def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30, cars_per_cycle=40, passengers_per_car=1.5, avg_arrivals=None):
     """
     Calculate the person delay for all traffic users with the given timing plan.
     
@@ -273,49 +490,92 @@ def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30,
     passengers_per_bus (int): Average number of passengers on the bus.
     cars_per_cycle (int): Average number of cars per cycle.
     passengers_per_car (float): Average number of passengers per car.
+    avg_arrivals (dict): Average vehicle arrivals per second.
     
     Returns:
     float: Estimated person delay.
     """
+    # Set default average arrivals if not provided
+    if avg_arrivals is None:
+        avg_arrivals = {
+            'north_south': 0.3,  # vehicles per second
+            'east_west': 0.25    # vehicles per second
+        }
+    
     # First calculate bus delay and multiply by number of passengers
     bus_delay = calculate_bus_delay(timing_plan, bus_arrival_time)
     total_bus_passenger_delay = bus_delay * passengers_per_bus
     
-    # Calculate average delay for cars based on the timing plan
+    # Calculate person delay over two complete cycles
     cycle_length = sum(phase['duration'] for phase in timing_plan)
+    two_cycles = min(cycle_length * 2, 200)  # Cap at 200 seconds
     
-    # Calculate green time for each direction
-    ns_green_time = sum(phase['duration'] for phase in timing_plan 
-                         if "North-South" in phase['phase'] and 
-                         "Yellow" not in phase['phase'] and 
-                         "Red Clearance" not in phase['phase'])
+    # Calculate queue lengths and delays for both directions
+    ns_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north_south', avg_arrivals, two_cycles)
+    ew_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east_west', avg_arrivals, two_cycles)
     
-    ew_green_time = sum(phase['duration'] for phase in timing_plan 
-                         if "East-West" in phase['phase'] and 
-                         "Yellow" not in phase['phase'] and 
-                         "Red Clearance" not in phase['phase'])
-    
-    # Calculate delay for cars in each direction
-    # Assume car distribution is proportional to green time allocation
-    ns_car_ratio = ns_green_time / (ns_green_time + ew_green_time) if (ns_green_time + ew_green_time) > 0 else 0.5
-    ew_car_ratio = ew_green_time / (ns_green_time + ew_green_time) if (ns_green_time + ew_green_time) > 0 else 0.5
-    
-    ns_cars = cars_per_cycle * ns_car_ratio
-    ew_cars = cars_per_cycle * ew_car_ratio
-    
-    # Estimate average delay for cars (half of red time)
-    ns_avg_delay = (cycle_length - ns_green_time) / 2
-    ew_avg_delay = (cycle_length - ew_green_time) / 2
-    
-    # Calculate total car passenger delay
-    ns_car_passenger_delay = ns_cars * ns_avg_delay * passengers_per_car
-    ew_car_passenger_delay = ew_cars * ew_avg_delay * passengers_per_car
-    total_car_passenger_delay = ns_car_passenger_delay + ew_car_passenger_delay
+    # Convert vehicle delay to person delay
+    ns_person_delay = ns_vehicle_delay * passengers_per_car
+    ew_person_delay = ew_vehicle_delay * passengers_per_car
     
     # Total person delay
-    total_person_delay = total_bus_passenger_delay + total_car_passenger_delay
+    total_person_delay = total_bus_passenger_delay + ns_person_delay + ew_person_delay
     
     return total_person_delay
+
+def calculate_vehicle_queue_delay(timing_plan, direction, avg_arrivals, horizon):
+    """
+    Calculate the total delay for vehicles in a queue over the specified horizon.
+    
+    Parameters:
+    timing_plan (list): Signal timing plan.
+    direction (str): Traffic direction ('north_south' or 'east_west').
+    avg_arrivals (dict): Average vehicle arrivals per second.
+    horizon (int): Time horizon in seconds.
+    
+    Returns:
+    float: Total vehicle delay in vehicle-seconds.
+    """
+    # Get detailed timing plan
+    detailed_plan = generate_detailed_timing_plan(timing_plan, horizon)
+    
+    # Track queue length and total delay
+    queue = 0
+    total_delay = 0
+    arrival_rate = avg_arrivals[direction]
+    
+    # Constants for queue dissipation
+    saturation_flow = 1.0  # vehicles per second during green
+    startup_lost_time = 2  # seconds
+    
+    for i in range(len(detailed_plan['seconds'])):
+        # Check signal status for this direction
+        if direction == 'north_south':
+            status = detailed_plan['north_south'][i]
+        else:
+            status = detailed_plan['east_west'][i]
+        
+        # Add new arrivals to queue
+        new_arrivals = arrival_rate
+        queue += new_arrivals
+        
+        # Process departures during green
+        if status == "GREEN":
+            # Account for startup lost time
+            if i > 0 and (direction == 'north_south' and detailed_plan['north_south'][i-1] != "GREEN" or
+                          direction == 'east_west' and detailed_plan['east_west'][i-1] != "GREEN"):
+                departure_rate = 0  # No departures during first startup_lost_time seconds
+            else:
+                departure_rate = saturation_flow
+            
+            # Vehicles leaving the queue
+            departures = min(queue, departure_rate)
+            queue -= departures
+        
+        # Add delay for all vehicles in queue during this second
+        total_delay += queue
+    
+    return total_delay
 
 def check_tsp_need(phase, remaining_time):
     """
@@ -352,13 +612,28 @@ if __name__ == "__main__":
         {'phase': 'East-West Left Red Clearance', 'duration': 1.2},
     ]
     
-    # Fixed bus arrival time for the exhaustive search
-    arrival_time = 85  # This is the fixed arrival time from your original code
+    # Average arrivals per second for each direction
+    avg_arrivals = {
+        'north_south': 0.3,  # vehicles per second
+        'east_west': 0.25    # vehicles per second
+    }
+    
+    # Current simulation time
+    current_time = 40  # seconds into the simulation
+    
+    # Fixed bus arrival time for the exhaustive search (absolute time)
+    arrival_time = 85  # This is the absolute arrival time
     
     # Get details about when the bus will arrive at the intersection
-    phase_info = find_bus_phase(arrival_time, signal_timing)
+    phase_info = find_bus_phase(arrival_time - current_time, 
+                               create_signal_plan_from_current_time(
+                                   signal_timing, 
+                                   *get_current_phase(current_time, signal_timing), 
+                                   200))
+    
     if not isinstance(phase_info, str):
         phase_name, remaining_time, status = phase_info
+        print(f"Current simulation time: {current_time} seconds")
         print(f"The bus will arrive at the {phase_name} phase with {remaining_time} seconds left ({status}).")
         
         # Check if TSP is needed
@@ -366,7 +641,14 @@ if __name__ == "__main__":
         print(tsp_message)
     
     # Run the exhaustive search
-    tsp_plans = exhaustive_search_tsp(signal_timing, arrival_time, max_extension=5)
+    tsp_plans = exhaustive_search_tsp(
+        signal_timing, 
+        arrival_time, 
+        current_time=current_time, 
+        max_extension=5, 
+        optimization_horizon=200,
+        avg_arrivals=avg_arrivals
+    )
     
     # Display the results
     print("\nExhaustive TSP Search Results:")
@@ -378,11 +660,17 @@ if __name__ == "__main__":
     print(f"Bus delay: {baseline['bus_delay']:.1f} seconds")
     print(f"Person delay: {baseline['person_delay']:.1f} seconds")
     
-    # Display top 10 plans
-    print("\nTop 10 TSP plans by bus delay:")
-    for i, plan in enumerate(tsp_plans[:10]):
+    # Save the detailed timing plan to a file
+    import json
+    with open('baseline_timing_plan.json', 'w') as f:
+        json.dump(baseline['detailed_timing'], f, indent=2)
+    print(f"Baseline timing plan saved to 'baseline_timing_plan.json'")
+    
+    # Display top 5 plans
+    print("\nTop 5 TSP plans by bus delay:")
+    for i, plan in enumerate(tsp_plans[:6]):
         if i == 0 and plan['type'] == 'No TSP':
-            # Skip the baseline plan in the top 10 if it's already the best
+            # Skip the baseline plan in the top 5 if it's already the best
             continue
             
         print("\n" + "-" * 80)
@@ -410,6 +698,11 @@ if __name__ == "__main__":
         if baseline['person_delay'] > 0:
             person_improvement = (baseline['person_delay'] - plan['person_delay']) / baseline['person_delay'] * 100
             print(f"Person delay improvement: {person_improvement:.1f}%")
+        
+        # Save the detailed timing plan to a file
+        with open(f'tsp_plan_{i+1}_timing.json', 'w') as f:
+            json.dump(plan['detailed_timing'], f, indent=2)
+        print(f"Timing plan saved to 'tsp_plan_{i+1}_timing.json'")
     
     # Find and display the best plan that minimizes person delay
     min_person_delay = min(plan['person_delay'] for plan in tsp_plans if plan['person_delay'] is not None)
@@ -440,3 +733,8 @@ if __name__ == "__main__":
     if baseline['person_delay'] > 0:
         person_improvement = (baseline['person_delay'] - best_person_plan['person_delay']) / baseline['person_delay'] * 100
         print(f"Person delay improvement: {person_improvement:.1f}%")
+    
+    # Save the best person plan to a file
+    with open('best_person_plan_timing.json', 'w') as f:
+        json.dump(best_person_plan['detailed_timing'], f, indent=2)
+    print(f"Best person plan saved to 'best_person_plan_timing.json'")
