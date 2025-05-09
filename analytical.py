@@ -1,125 +1,151 @@
-# Visva's edit
-def exhaustive_search_tsp(signal_timing, arrival_time, current_time=0, max_extension=5, optimization_horizon=200, avg_arrivals=None):
+import copy
+import json
+from typing import Dict, List, Optional, Tuple
+
+MIN_GREEN = 5  # minimum green duration in seconds
+YELLOW_DURATION = 4  # fixed yellow duration after every green
+
+def validate_plan(plan: List[Dict]) -> bool:
     """
-    Perform an exhaustive search that tests applying TSP at every possible second
-    of the traffic signal cycle to find optimal timing plans for a fixed bus arrival time.
-    
-    Parameters:
-    signal_timing (list): A list of dictionaries representing the signal timing plan.
-    arrival_time (int): The fixed arrival time of the bus in seconds.
-    current_time (int): Current simulation time in seconds.
-    max_extension (int): The maximum extension for TSP (in seconds).
-    optimization_horizon (int): Time horizon for optimization in seconds.
-    avg_arrivals (dict): Average vehicle arrivals per second for each direction.
-    
-    Returns:
-    list: A list of modified signal timing plans with performance metrics.
+    Validate a 4-phase signal plan.
+    - Exactly 4 phases.
+    - Alternates Green, Yellow, Green, Yellow.
+    - Green >= MIN_GREEN, Yellow == YELLOW_DURATION.
     """
-    # Set default average arrivals if not provided
+    if len(plan) != 4:
+        return False
+    for i, phase in enumerate(plan):
+        if i % 2 == 0:
+            # Green phase
+            if "Green" not in phase['phase'] or phase['duration'] < MIN_GREEN:
+                return False
+        else:
+            # Yellow phase
+            if "Yellow" not in phase['phase'] or abs(phase['duration'] - YELLOW_DURATION) > 0.01:
+                return False
+    return True
+
+def adjust_four_phase_plan_to_cycle_length(plan: List[Dict], target_cycle_length: float) -> List[Dict]:
+    """
+    Adjust the green durations in a four-phase plan so that the total cycle length matches the target.
+    Keeps yellow durations fixed, distributes extra/missing time proportionally to green phases.
+    """
+    green_indices = [i for i, p in enumerate(plan) if "Green" in p['phase']]
+    yellow_indices = [i for i, p in enumerate(plan) if "Yellow" in p['phase']]
+    total_green = sum(plan[i]['duration'] for i in green_indices)
+    total_yellow = sum(plan[i]['duration'] for i in yellow_indices)
+    current_cycle = total_green + total_yellow
+    diff = target_cycle_length - current_cycle
+    if abs(diff) < 1e-6:
+        return plan
+    # Distribute diff proportionally to green phases
+    for i in green_indices:
+        prop = plan[i]['duration'] / total_green if total_green > 0 else 0.5
+        plan[i]['duration'] += diff * prop
+        plan[i]['duration'] = max(plan[i]['duration'], MIN_GREEN)
+    # Recalculate in case rounding caused drift
+    total_green = sum(plan[i]['duration'] for i in green_indices)
+    plan_cycle = total_green + total_yellow
+    # If still off, adjust first green
+    if abs(plan_cycle - target_cycle_length) > 1e-6:
+        plan[green_indices[0]]['duration'] += target_cycle_length - plan_cycle
+        plan[green_indices[0]]['duration'] = max(plan[green_indices[0]]['duration'], MIN_GREEN)
+    return plan
+
+def extract_four_phases(full_plan: List[Dict]) -> List[Dict]:
+    """
+    Extract the four core phases (NS/EW Green/Yellow) in order from a possibly expanded plan.
+    Returns a list of 4 dicts: [NS Green, NS Yellow, EW Green, EW Yellow].
+    """
+    core_phases = []
+    ns_green = next((p for p in full_plan if "North-South Through Green" in p['phase'] or (p['phase'] == "North-South Through" and "Green" in p['phase'])), None)
+    ns_yellow = next((p for p in full_plan if "North-South Through Yellow" in p['phase']), None)
+    ew_green = next((p for p in full_plan if "East-West Through Green" in p['phase'] or (p['phase'] == "East-West Through" and "Green" in p['phase'])), None)
+    ew_yellow = next((p for p in full_plan if "East-West Through Yellow" in p['phase']), None)
+    # Fallback: try to match by phase name if above fails
+    if not ns_green:
+        ns_green = next((p for p in full_plan if "North-South Through" in p['phase'] and "Yellow" not in p['phase']), None)
+    if not ew_green:
+        ew_green = next((p for p in full_plan if "East-West Through" in p['phase'] and "Yellow" not in p['phase']), None)
+    if not ns_yellow:
+        ns_yellow = next((p for p in full_plan if "North-South Through Yellow" in p['phase']), None)
+    if not ew_yellow:
+        ew_yellow = next((p for p in full_plan if "East-West Through Yellow" in p['phase']), None)
+    for p in [ns_green, ns_yellow, ew_green, ew_yellow]:
+        if p:
+            core_phases.append({'phase': p['phase'], 'duration': p['duration']})
+        else:
+            core_phases.append({'phase': '', 'duration': 0})
+    return core_phases
+
+def exhaustive_search_tsp(
+    signal_timing: List[Dict],
+    arrival_time: float,
+    current_time: float = 0,
+    max_extension: int = 5,
+    optimization_horizon: int = 200,
+    avg_arrivals: Optional[Dict] = None
+) -> List[Dict]:
+    """
+    Perform exhaustive search for TSP insertion, returning only valid 4-phase plans.
+    """
     if avg_arrivals is None:
         avg_arrivals = {
-            'north left': 0.3,  # vehicles per second
-            'north through': 0.3, 
-            'north right': .2,
-            'south left': 0.3,  # vehicles per second
-            'south through': 0.3, 
-            'south right': .2,
-            'east left': 0.3,  # vehicles per second
-            'east through': 0.3, 
-            'east right': .2,
-            'west left': 0.3,  # vehicles per second
-            'west through': 0.3, 
-            'west right': .2,   
+            'north left': 0.3, 'north through': 0.3, 'north right': .2,
+            'south left': 0.3, 'south through': 0.3, 'south right': .2,
+            'east left': 0.3, 'east through': 0.3, 'east right': .2,
+            'west left': 0.3, 'west through': 0.3, 'west right': .2,
         }
-        
-    # Calculate total cycle length
     cycle_length = sum(phase['duration'] for phase in signal_timing)
-    
-    # Adjust arrival time based on current time
     adjusted_arrival_time = arrival_time - current_time if arrival_time >= current_time else arrival_time
-    
-    # Determine current position in the signal timing plan based on current_time
     current_phase_info = get_current_phase(current_time, signal_timing)
     if current_phase_info is None:
         current_phase_index, time_elapsed_in_phase = 0, 0
     else:
         current_phase_index, time_elapsed_in_phase = current_phase_info
-    
-    # Create a modified signal timing plan starting from current_time
     current_signal_timing = create_signal_plan_from_current_time(signal_timing, current_phase_index, time_elapsed_in_phase, optimization_horizon)
-    
-    # List to store all possible TSP timing plans
     tsp_plans = []
-    
-    # First, add a baseline "no TSP" plan
-    enforced_baseline = enforce_yellow_and_min_green(current_signal_timing)
-    if enforced_baseline is None or not is_valid_signal_plan(enforced_baseline):
-        baseline_plan = None
-    else:
-        baseline_plan = {
-            'plan': enforced_baseline.copy(),
-            'type': 'No TSP',
-            'insertion_point': None,
-            'extension': None,
-            'bus_delay': calculate_bus_delay(enforced_baseline, adjusted_arrival_time),
-            'person_delay': calculate_person_delay(enforced_baseline, adjusted_arrival_time, avg_arrivals=avg_arrivals),
-            'detailed_timing': generate_detailed_timing_plan(enforced_baseline, optimization_horizon)
-        }
+    # Baseline plan
+    baseline_plan = {
+        'plan': extract_four_phases(current_signal_timing),
+        'type': 'No TSP',
+        'insertion_point': None,
+        'extension': None,
+        'bus_delay': calculate_bus_delay(current_signal_timing, adjusted_arrival_time),
+        'person_delay': calculate_person_delay(current_signal_timing, adjusted_arrival_time, avg_arrivals=avg_arrivals, cycle_length=cycle_length),
+        'detailed_timing': generate_detailed_timing_plan(current_signal_timing, optimization_horizon, cycle_length)
+    }
+    baseline_plan['plan'] = adjust_four_phase_plan_to_cycle_length(baseline_plan['plan'], cycle_length)
+    if validate_plan(baseline_plan['plan']):
         tsp_plans.append(baseline_plan)
-    
-    # Get the current phase, remaining time, and status based on arrival time
     phase_info = find_bus_phase(adjusted_arrival_time, current_signal_timing)
-    
-    # Skip if arrival time is outside the cycle
     if isinstance(phase_info, str):
         return tsp_plans
-        
     phase_name, remaining_time, status = phase_info
-    
-    # For each possible insertion point in the cycle
     for insertion_second in range(min(int(cycle_length), optimization_horizon)):
-        # Determine which phase contains this second
         insertion_phase_info = find_insertion_phase(insertion_second, current_signal_timing)
-        
         if insertion_phase_info is None:
             continue
-        
         insertion_phase_index, time_within_phase = insertion_phase_info
-        
-        # Create a copy of the current signal timing plan
         modified_plan = [phase.copy() for phase in current_signal_timing]
-        
-        # Determine if we need dynamic extension (5 or 7 seconds)
-        dynamic_extension = determine_dynamic_extension(
+        dynamic_extension = MIN_GREEN  # always use MIN_GREEN for extension in this context
+        tsp_modified_plan = apply_tsp_at_time(
             modified_plan,
             insertion_phase_index,
-            phase_name,
-            status,
-            avg_arrivals
-        )
-        
-        # Apply TSP at this insertion point
-        tsp_modified_plan = apply_tsp_at_time(
-            modified_plan, 
-            insertion_phase_index, 
-            time_within_phase, 
+            time_within_phase,
             dynamic_extension
         )
-        
-        # Only add valid plans
-        if tsp_modified_plan is None or not is_valid_signal_plan(tsp_modified_plan):
+        if tsp_modified_plan is None:
             continue
-        
-        # Calculate performance metrics for this plan
+        four_phase_plan = extract_four_phases(tsp_modified_plan)
+        four_phase_plan = adjust_four_phase_plan_to_cycle_length(four_phase_plan, cycle_length)
+        if not validate_plan(four_phase_plan):
+            continue
         bus_delay = calculate_bus_delay(tsp_modified_plan, adjusted_arrival_time)
-        person_delay = calculate_person_delay(tsp_modified_plan, adjusted_arrival_time, avg_arrivals=avg_arrivals)
-        
-        # Generate detailed timing plan
-        detailed_timing = generate_detailed_timing_plan(tsp_modified_plan, optimization_horizon)
-        
-        # Add this plan to our list
+        person_delay = calculate_person_delay(tsp_modified_plan, adjusted_arrival_time, avg_arrivals=avg_arrivals, cycle_length=cycle_length)
+        detailed_timing = generate_detailed_timing_plan(tsp_modified_plan, optimization_horizon, cycle_length)
         tsp_plans.append({
-            'plan': tsp_modified_plan,
+            'plan': four_phase_plan,
             'type': "TSP Insertion",
             'insertion_point': insertion_second,
             'extension': dynamic_extension,
@@ -127,14 +153,144 @@ def exhaustive_search_tsp(signal_timing, arrival_time, current_time=0, max_exten
             'person_delay': person_delay,
             'detailed_timing': detailed_timing
         })
-    
-    # Sort plans by bus delay (primary) and person delay (secondary)
+    tsp_plans = [p for p in tsp_plans if validate_plan(p['plan'])]
     tsp_plans.sort(key=lambda x: (
         float('inf') if x['bus_delay'] is None else x['bus_delay'],
         float('inf') if x['person_delay'] is None else x['person_delay']
     ))
-    
     return tsp_plans
+
+def apply_tsp_at_time(
+    signal_plan: List[Dict],
+    phase_index: int,
+    time_in_phase: float,
+    extension: int
+) -> Optional[List[Dict]]:
+    """
+    Apply TSP by splitting a green phase and inserting TSP green/yellow.
+    EW greens are reduced proportionally to keep cycle length, but never below MIN_GREEN.
+    """
+    modified_plan = [phase.copy() for phase in signal_plan]
+    phase = modified_plan[phase_index]
+    if "Green" not in phase['phase'] and "Through" not in phase['phase']:
+        return None
+    before_duration = time_in_phase
+    after_duration = phase['duration'] - time_in_phase
+    if (before_duration > 0 and before_duration < MIN_GREEN) or (after_duration > 0 and after_duration < MIN_GREEN):
+        return None
+    del modified_plan[phase_index]
+    insert_at = phase_index
+    if before_duration >= MIN_GREEN:
+        modified_plan.insert(insert_at, {'phase': phase['phase'], 'duration': before_duration})
+        insert_at += 1
+    tsp_green = {'phase': "North-South Through Green", 'duration': extension}
+    tsp_yellow = {'phase': "North-South Through Yellow", 'duration': YELLOW_DURATION}
+    modified_plan.insert(insert_at, tsp_green)
+    modified_plan.insert(insert_at + 1, tsp_yellow)
+    insert_at += 2
+    if after_duration >= MIN_GREEN:
+        modified_plan.insert(insert_at, {'phase': phase['phase'], 'duration': after_duration})
+    # Adjust EW greens proportionally to keep cycle length
+    total_cycle_time = sum(p['duration'] for p in modified_plan)
+    original_cycle_time = sum(p['duration'] for p in signal_plan)
+    time_to_remove = total_cycle_time - original_cycle_time
+    ew_green_indices = [i for i, p in enumerate(modified_plan) if "East-West Through" in p['phase'] and "Green" in p['phase']]
+    if time_to_remove > 0 and ew_green_indices:
+        total_ew_green = sum(modified_plan[i]['duration'] for i in ew_green_indices)
+        for i in ew_green_indices:
+            green = modified_plan[i]
+            max_reducible = green['duration'] - MIN_GREEN
+            reduction = min(time_to_remove * (green['duration'] / total_ew_green), max_reducible)
+            green['duration'] -= reduction
+            time_to_remove -= reduction
+            if time_to_remove <= 0:
+                break
+        if time_to_remove > 0:
+            return None
+    # Enforce yellow and min green
+    enforced = enforce_yellow_and_min_green(modified_plan)
+    if enforced is None or not is_valid_signal_plan(enforced):
+        return None
+    return enforced
+
+def generate_detailed_timing_plan(signal_timing: List[Dict], horizon: int, cycle_length: float) -> Dict:
+    """
+    Generate a second-by-second plan:
+    {
+        'seconds': [...],
+        'phase': [...],
+        'directions': {
+            'North-South-Left': [...],
+            'North-South-Through': [...],
+            'East-West-Left': [...],
+            'East-West-Through': [...]
+        }
+    }
+    Each direction array contains "GREEN", "YELLOW", or "RED" for each second.
+    """
+    # Define which phases control which directions and their color mapping
+    direction_phase_map = {
+        'North-South-Left': {
+            'green': ['North-South Left Green'],
+            'yellow': ['North-South Left Yellow']
+        },
+        'North-South-Through': {
+            'green': ['North-South Through Green'],
+            'yellow': ['North-South Through Yellow']
+        },
+        'East-West-Left': {
+            'green': ['East-West Left Green'],
+            'yellow': ['East-West Left Yellow']
+        },
+        'East-West-Through': {
+            'green': ['East-West Through Green'],
+            'yellow': ['East-West Through Yellow']
+        }
+    }
+    # If left phases are not present, treat through phases as controlling all
+    # (for simple 4-phase plans)
+    for d in direction_phase_map:
+        if not any(phase['phase'] in direction_phase_map[d]['green'] for phase in signal_timing):
+            if 'Through' in d:
+                direction_phase_map[d]['green'] = [d.replace('-', ' ') + ' Green']
+                direction_phase_map[d]['yellow'] = [d.replace('-', ' ') + ' Yellow']
+            else:
+                # For lefts, fallback to through
+                base = d.replace('Left', 'Through')
+                direction_phase_map[d]['green'] = [base.replace('-', ' ') + ' Green']
+                direction_phase_map[d]['yellow'] = [base.replace('-', ' ') + ' Yellow']
+
+    detailed = {
+        'seconds': [],
+        'phase': [],
+        'directions': {
+            'North-South-Left': [],
+            'North-South-Through': [],
+            'East-West-Left': [],
+            'East-West-Through': []
+        }
+    }
+    current_second = 0
+    phase_idx = 0
+    phase_time = 0
+    while current_second < horizon:
+        phase = signal_timing[phase_idx]
+        phase_duration = int(round(phase['duration']))
+        for t in range(phase_duration):
+            if current_second >= horizon:
+                break
+            detailed['seconds'].append(current_second)
+            detailed['phase'].append(phase['phase'])
+            for direction, mapping in direction_phase_map.items():
+                if phase['phase'] in mapping['green']:
+                    detailed['directions'][direction].append("GREEN")
+                elif phase['phase'] in mapping['yellow']:
+                    detailed['directions'][direction].append("YELLOW")
+                else:
+                    detailed['directions'][direction].append("RED")
+            current_second += 1
+        phase_idx = (phase_idx + 1) % len(signal_timing)
+    return detailed
 
 def determine_dynamic_extension(timing_plan, phase_index, bus_phase, status, avg_arrivals):
     """
@@ -164,8 +320,6 @@ def determine_dynamic_extension(timing_plan, phase_index, bus_phase, status, avg
             extension = 7
     
     return extension
-
-
 
 def estimate_queue_length(timing_plan, direction, avg_arrivals):
     """
@@ -270,86 +424,6 @@ def create_signal_plan_from_current_time(signal_timing, current_phase_index, tim
     
     return new_plan
 
-def generate_detailed_timing_plan(signal_timing, horizon):
-    """
-    Generate a detailed second-by-second signal timing plan.
-    
-    Parameters:
-    signal_timing (list): Signal timing plan.
-    horizon (int): Time horizon in seconds.
-    
-    Returns:
-    dict: Detailed timing plan with second-by-second phase information.
-    """
-    detailed_plan = {
-        'seconds': [],
-        'North-South-Left': [],
-        'North-South-Through': [],
-        'East-West-Left': [],
-        'East-West-Through': []
-    }
-    
-    # Generate second-by-second phase information
-    current_second = 0
-    cumulative_time = 0
-    
-    for phase in signal_timing:
-        phase_duration = phase['duration']
-        phase_end = cumulative_time + phase_duration
-        
-        # Determine phase status for each direction
-        ns_left_status = "RED"
-        ns_through_status = "RED"
-        ew_left_status = "RED"
-        ew_through_status = "RED"
-        
-        
-        if "North-South-Through" in phase['phase']:
-            if "Yellow" in phase['phase']:
-                ns_through_status = "YELLOW"
-            elif "Red Clearance" in phase['phase']:
-                ns_through_status = "RED"
-            else:
-                ns_through_status = "GREEN"
-        elif "East-West-Left" in phase['phase']:
-            if "Yellow" in phase['phase']:
-                ew_left_status = "YELLOW"
-            elif "Red Clearance" in phase['phase']:
-                ew_left_status = "RED"
-            else:
-                ew_left_status = "GREEN"
-        elif "East-West-Through" in phase['phase']:
-            if "Yellow" in phase['phase']:
-                ew_through_status = "YELLOW"
-            elif "Red Clearance" in phase['phase']:
-                ew_through_status = "RED"
-            else:
-                ew_through_status = "GREEN"
-        elif "North-South-Left" in phase['phase']:
-            if "Yellow" in phase['phase']:
-                ns_left_status = "YELLOW"
-            elif "Red Clearance" in phase['phase']:
-                ns_left_status = "RED"
-            else:
-                ns_left_status = "GREEN"
-        
-        
-        # Add each second in this phase to the detailed plan
-        while cumulative_time < phase_end and current_second < horizon:
-            detailed_plan['seconds'].append(current_second)
-            detailed_plan['North-South-Left'].append(ns_left_status)
-            detailed_plan['North-South-Through'].append(ns_through_status)
-            detailed_plan['East-West-Left'].append(ew_left_status)
-            detailed_plan['East-West-Through'].append(ew_through_status)
-            
-            current_second += 1
-            cumulative_time += 1
-        
-        if current_second >= horizon:
-            break
-    
-    return detailed_plan
-
 def find_bus_phase(arrival_time, signal_timing):
     """
     Determine which phase the bus will arrive at based on its arrival time,
@@ -413,77 +487,6 @@ def find_insertion_phase(insertion_second, signal_timing):
     
     return None
 
-def apply_tsp_at_time(signal_plan, phase_index, time_in_phase, extension):
-    """
-    Apply TSP by inserting a TSP green phase at the specified time point.
-    
-    Parameters:
-    signal_plan (list): Signal timing plan.
-    phase_index (int): Index of the phase containing the insertion point.
-    time_in_phase (int): Time within the phase for TSP insertion.
-    extension (int): Duration of TSP extension.
-    
-    Returns:
-    list: Modified signal plan with TSP applied.
-    """
-    modified_plan = [phase.copy() for phase in signal_plan]
-    
-    # Determine the bus direction (assuming North-South direction for buses)
-    bus_direction = "North-South-Through"
-    
-    # Find competing direction phases to reduce time from
-    competing_indices = []
-    for i, phase in enumerate(modified_plan):
-        if "East-West" in phase['phase'] and "Yellow" not in phase['phase'] and "Red Clearance" not in phase['phase']:
-            competing_indices.append(i)
-    
-    # Split current phase at time_in_phase
-    current_duration = modified_plan[phase_index]['duration']
-    modified_plan[phase_index]['duration'] = time_in_phase
-    
-    # Create a TSP green phase for bus direction
-    tsp_phase = {
-        'phase': "North-South-Through TSP Green",
-        'duration': extension
-    }
-    tsp_yellow = {
-        'phase': "North-South-Through TSP Yellow",
-        'duration': 4.0
-    }
-    
-    # Create the remainder of the original phase
-    remainder_phase = modified_plan[phase_index].copy()
-    remainder_phase['duration'] = current_duration - time_in_phase
-    
-    # Insert the TSP phase and remainder
-    modified_plan.insert(phase_index + 1, tsp_phase)
-    modified_plan.insert(phase_index + 2, tsp_yellow)
-    modified_plan.insert(phase_index + 3, remainder_phase)
-    
-    # Reduce time from competing direction to maintain cycle length
-    total_cycle_time = sum(phase['duration'] for phase in modified_plan)
-    original_cycle_time = sum(phase['duration'] for phase in signal_plan)
-    time_to_remove = total_cycle_time - original_cycle_time
-    
-    if competing_indices and time_to_remove > 0:
-        reduction_per_phase = time_to_remove / len(competing_indices)
-        for idx in competing_indices:
-            # Need to adjust indices for the newly inserted phases
-            adjusted_idx = idx
-            if idx > phase_index:
-                adjusted_idx += 2
-            
-            # Ensure minimum green time is maintained
-            if modified_plan[adjusted_idx]['duration'] - reduction_per_phase >= 5:  # Minimum green time
-                modified_plan[adjusted_idx]['duration'] -= reduction_per_phase
-    
-    # Enforce yellow and min green
-    enforced = enforce_yellow_and_min_green(modified_plan)
-    if enforced is None or not is_valid_signal_plan(enforced):
-        return None
-    
-    return enforced
-
 def calculate_bus_delay(timing_plan, bus_arrival_time, bus_speed=40, stop_distance=750):
     """
     Calculate the delay a bus would experience with the given timing plan.
@@ -543,22 +546,18 @@ def calculate_bus_delay(timing_plan, bus_arrival_time, bus_speed=40, stop_distan
     
     return 0  # Default case
 
-def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30, cars_per_cycle=40, passengers_per_car=1.5, avg_arrivals=None):
+def calculate_person_delay(
+    timing_plan, 
+    bus_arrival_time, 
+    passengers_per_bus=30, 
+    cars_per_cycle=40, 
+    passengers_per_car=1.5, 
+    avg_arrivals=None,
+    cycle_length=None
+):
     """
     Calculate the person delay for all traffic users with the given timing plan.
-    
-    Parameters:
-    timing_plan (list): Signal timing plan.
-    bus_arrival_time (int): Time of bus arrival at the detection point.
-    passengers_per_bus (int): Average number of passengers on the bus.
-    cars_per_cycle (int): Average number of cars per cycle.
-    passengers_per_car (float): Average number of passengers per car.
-    avg_arrivals (dict): Average vehicle arrivals per second.
-    
-    Returns:
-    float: Estimated person delay.
     """
-    # Set default average arrivals if not provided
     if avg_arrivals is None:
         avg_arrivals = {
             'north left': 0.3,  # vehicles per second
@@ -574,30 +573,32 @@ def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30,
             'west through': 0.3, 
             'west right': .2,      # vehicles per second
         }
-    
-    # First calculate bus delay and multiply by number of passengers
     bus_delay = calculate_bus_delay(timing_plan, bus_arrival_time)
     total_bus_passenger_delay = bus_delay * passengers_per_bus
-    
     # Calculate person delay over two complete cycles
-    cycle_length = sum(phase['duration'] for phase in timing_plan)
+    if cycle_length is None:
+        cycle_length = sum(phase['duration'] for phase in timing_plan)
     two_cycles = min(cycle_length * 2, 200)  # Cap at 200 seconds
-    
-    # Calculate queue lengths for all movements
-    north_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north left', avg_arrivals, two_cycles)
-    north_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north through', avg_arrivals, two_cycles)
-    north_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north right', avg_arrivals, two_cycles)
-    south_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south left', avg_arrivals, two_cycles)
-    south_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south through', avg_arrivals, two_cycles)
-    south_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south right', avg_arrivals, two_cycles)
-    east_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east left', avg_arrivals, two_cycles)
-    east_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east through', avg_arrivals, two_cycles)
-    east_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east right', avg_arrivals, two_cycles)
-    west_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west left', avg_arrivals, two_cycles)
-    west_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west through', avg_arrivals, two_cycles)
-    west_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west right', avg_arrivals, two_cycles)
-    
-    # Convert vehicle delay to person delay
+    north_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north left', avg_arrivals, two_cycles, cycle_length)
+    north_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north through', avg_arrivals, two_cycles, cycle_length)
+    north_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'north right', avg_arrivals, two_cycles, cycle_length)
+    south_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south left', avg_arrivals, two_cycles, cycle_length)
+    south_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south through', avg_arrivals, two_cycles, cycle_length)
+    south_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'south right', avg_arrivals, two_cycles, cycle_length)
+    east_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east left', avg_arrivals, two_cycles, cycle_length)
+    east_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east through', avg_arrivals, two_cycles, cycle_length)
+    east_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'east right', avg_arrivals, two_cycles, cycle_length)
+    west_left_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west left', avg_arrivals, two_cycles, cycle_length)
+    west_through_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west through', avg_arrivals, two_cycles, cycle_length)
+    west_right_vehicle_delay = calculate_vehicle_queue_delay(timing_plan, 'west right', avg_arrivals, two_cycles, cycle_length)
+    delays = [
+        north_left_vehicle_delay, north_through_vehicle_delay, north_right_vehicle_delay,
+        south_left_vehicle_delay, south_through_vehicle_delay, south_right_vehicle_delay,
+        east_left_vehicle_delay, east_through_vehicle_delay, east_right_vehicle_delay,
+        west_left_vehicle_delay, west_through_vehicle_delay, west_right_vehicle_delay
+    ]
+    if any(d == float('inf') for d in delays):
+        return float('inf')
     nl_person_delay = north_left_vehicle_delay * passengers_per_car
     nt_person_delay = north_through_vehicle_delay * passengers_per_car
     nr_person_delay = north_right_vehicle_delay * passengers_per_car
@@ -610,69 +611,56 @@ def calculate_person_delay(timing_plan, bus_arrival_time, passengers_per_bus=30,
     wl_person_delay = west_left_vehicle_delay * passengers_per_car
     wt_person_delay = west_through_vehicle_delay * passengers_per_car
     wr_person_delay = west_right_vehicle_delay * passengers_per_car
-    
-    # Total person delay
     total_person_delay = total_bus_passenger_delay + nl_person_delay + nt_person_delay + nr_person_delay + sl_person_delay + st_person_delay + sr_person_delay + el_person_delay + et_person_delay + er_person_delay + wt_person_delay + wl_person_delay + wr_person_delay
-    
     return total_person_delay
 
-def calculate_vehicle_queue_delay(timing_plan, direction, avg_arrivals, horizon):
+def calculate_vehicle_queue_delay(timing_plan, direction, avg_arrivals, horizon, cycle_length=None):
     """
     Calculate the total delay for vehicles in a queue over the specified horizon.
-    
-    Parameters:
-    timing_plan (list): Signal timing plan.
-    direction (str): Traffic direction ('north_south' or 'east_west').
-    avg_arrivals (dict): Average vehicle arrivals per second.
-    horizon (int): Time horizon in seconds.
-    
-    Returns:
-    float: Total vehicle delay in vehicle-seconds.
+    Uses correct mapping for direction and phase.
     """
-    # Get detailed timing plan
-    detailed_plan = generate_detailed_timing_plan(timing_plan, horizon)
-    
-    # Track queue length and total delay
+    if cycle_length is None:
+        cycle_length = sum(phase['duration'] for phase in timing_plan)
+    detailed_plan = generate_detailed_timing_plan(timing_plan, horizon, cycle_length)
+    # Defensive: If detailed_plan is empty or invalid, return a very high delay to avoid selection
+    if not detailed_plan or not detailed_plan['seconds']:
+        return float('inf')
+    # Map direction to detailed_plan key
+    dir_map = {
+        'north left': 'North-South-Left',
+        'north through': 'North-South-Through',
+        'south left': 'North-South-Left',
+        'south through': 'North-South-Through',
+        'east left': 'East-West-Left',
+        'east through': 'East-West-Through',
+        'west left': 'East-West-Left',
+        'west through': 'East-West-Through',
+        'north right': 'North-South-Left',
+        'south right': 'North-South-Left',
+        'east right': 'East-West-Left',
+        'west right': 'East-West-Left'
+    }
+    phase_key = dir_map[direction]
     queue = 0
     total_delay = 0
     arrival_rate = avg_arrivals[direction]
-    
-    # Constants for queue dissipation
     saturation_flow = 1.0  # vehicles per second during green
     startup_lost_time = 2  # seconds
-    
-    #fix this 4/24
+    green_streak = 0
     for i in range(len(detailed_plan['seconds'])):
-        # Check signal status for this direction
-        if direction == 'North-South-Left':
-            status = detailed_plan['North-South-Left'][i]
-        elif direction == 'North-South-Through':
-            status = detailed_plan['North-South-Through'][i]
-        elif direction == 'East-West-Left':
-            status = detailed_plan['East-West-Left'][i]
-        else:
-            status = detailed_plan['East-West-Through'][i]
-        
-        # Add new arrivals to queue
-        new_arrivals = arrival_rate
-        queue += new_arrivals
-        
-        # Process departures during green
+        status = detailed_plan['directions'][phase_key][i]
+        queue += arrival_rate
         if status == "GREEN":
-            # Account for startup lost time
-            if i > 0 and (direction == 'north_south' and detailed_plan['north_south'][i-1] != "GREEN" or
-                          direction == 'east_west' and detailed_plan['east_west'][i-1] != "GREEN"):
-                departure_rate = 0  # No departures during first startup_lost_time seconds
+            if green_streak < startup_lost_time:
+                departure_rate = 0
+                green_streak += 1
             else:
                 departure_rate = saturation_flow
-            
-            # Vehicles leaving the queue
             departures = min(queue, departure_rate)
             queue -= departures
-        
-        # Add delay for all vehicles in queue during this second
+        else:
+            green_streak = 0
         total_delay += queue
-    
     return total_delay
 
 def check_tsp_need(phase, remaining_time):
@@ -681,7 +669,7 @@ def check_tsp_need(phase, remaining_time):
 
     Parameters:
     phase (str): The phase name.
-    remaining_time (float): The remaining time in the phase when the bus arrives.
+    remaining time (float): The remaining time in the phase when the bus arrives.
 
     Returns:
     str: A message indicating if TSP is needed.
@@ -693,216 +681,188 @@ def check_tsp_need(phase, remaining_time):
     else:
         return "Red TSP strategy is needed."
 
-def enforce_yellow_and_min_green(signal_plan):
+def enforce_yellow_and_min_green(signal_plan: List[Dict]) -> Optional[List[Dict]]:
     """
-    Ensure every green phase is followed by a 4s yellow, and all greens are at least 5s.
+    Ensure every green phase is followed by a 4s yellow, and all greens are at least MIN_GREEN.
     Returns a new plan or None if constraints are violated.
     """
     new_plan = []
     i = 0
     while i < len(signal_plan):
         phase = signal_plan[i]
-        # Only process main green or TSP green phases
         if "Green" in phase['phase']:
-            # Enforce minimum green time
-            if phase['duration'] < 5:
+            if phase['duration'] < MIN_GREEN:
                 return None
             new_plan.append({'phase': phase['phase'], 'duration': phase['duration']})
-            # Insert yellow after green
             yellow_phase = phase['phase'].replace("Green", "Yellow")
-            new_plan.append({'phase': yellow_phase, 'duration': 4.0})
-            # Skip any yellow that may have been in the original plan
+            new_plan.append({'phase': yellow_phase, 'duration': YELLOW_DURATION})
             if i+1 < len(signal_plan) and "Yellow" in signal_plan[i+1]['phase']:
                 i += 1
         elif "Yellow" in phase['phase']:
-            # Already handled by green above, skip
             pass
         else:
-            # Red or other phases, just copy
             new_plan.append({'phase': phase['phase'], 'duration': phase['duration']})
         i += 1
+    if not any("Green" in p['phase'] for p in new_plan):
+        return None
     return new_plan
 
-def is_valid_signal_plan(signal_plan):
+def is_valid_signal_plan(signal_plan: List[Dict]) -> bool:
     """
-    Returns True if all green phases are >=5s and every green is followed by a yellow (4s).
-    Also ensures no green cuts off a yellow.
+    Returns True if all green phases are >=MIN_GREEN and every green is followed by a yellow (YELLOW_DURATION).
     """
+    has_green = False
     for i, phase in enumerate(signal_plan):
         if "Green" in phase['phase']:
-            if phase['duration'] < 5:
+            has_green = True
+            if phase['duration'] < MIN_GREEN:
                 return False
-            # Next phase must be yellow for same movement
             if i+1 >= len(signal_plan):
                 return False
             expected_yellow = phase['phase'].replace("Green", "Yellow")
-            if signal_plan[i+1]['phase'] != expected_yellow or abs(signal_plan[i+1]['duration'] - 4.0) > 0.01:
+            if signal_plan[i+1]['phase'] != expected_yellow or abs(signal_plan[i+1]['duration'] - YELLOW_DURATION) > 0.01:
                 return False
-        if "Yellow" in phase['phase']:
-            # No green should start before yellow is done (by construction above)
-            pass
+    return has_green
+
+def track_vehicle_queue(signal_timing, direction, avg_arrivals, horizon=200, cycle_length=None):
+    """
+    Track the queue length for a given direction over the specified horizon.
+    Returns a list of queue lengths per second.
+    """
+    if cycle_length is None:
+        cycle_length = sum(phase['duration'] for phase in signal_timing)
+    detailed_plan = generate_detailed_timing_plan(signal_timing, horizon, cycle_length)
+    dir_map = {
+        'north left': 'North-South-Left',
+        'north through': 'North-South-Through',
+        'south left': 'North-South-Left',
+        'south through': 'North-South-Through',
+        'east left': 'East-West-Left',
+        'east through': 'East-West-Through',
+        'west left': 'East-West-Left',
+        'west through': 'East-West-Through',
+        'north right': 'North-South-Left',
+        'south right': 'North-South-Left',
+        'east right': 'East-West-Left',
+        'west right': 'East-West-Left'
+    }
+    phase_key = dir_map[direction]
+    queue_lengths = []
+    queue = 0
+    arrival_rate = avg_arrivals[direction]
+    saturation_flow = 1.0  # vehicles per second during green
+    startup_lost_time = 2  # seconds
+    green_streak = 0
+    for i in range(len(detailed_plan['seconds'])):
+        status = detailed_plan['directions'][phase_key][i]
+        queue += arrival_rate
+        if status == "GREEN":
+            if green_streak < startup_lost_time:
+                departure_rate = 0
+                green_streak += 1
+            else:
+                departure_rate = saturation_flow
+            departures = min(queue, departure_rate)
+            queue -= departures
+        else:
+            green_streak = 0
+        queue_lengths.append(queue)
+    return queue_lengths
+
+def is_detailed_plan_all_red(detailed_plan):
+    """
+    Returns True if all directions are RED for all seconds in the detailed plan.
+    Returns True if the plan is None or empty (since we can't use a plan with no signals).
+    """
+    if detailed_plan is None or not isinstance(detailed_plan, dict) or 'seconds' not in detailed_plan or not detailed_plan['seconds']:
+        return True
+    for sec in range(len(detailed_plan['seconds'])):
+        if (detailed_plan['directions']['North-South-Left'][sec] == "GREEN" or
+            detailed_plan['directions']['North-South-Through'][sec] == "GREEN" or
+            detailed_plan['directions']['East-West-Left'][sec] == "GREEN" or
+            detailed_plan['directions']['East-West-Through'][sec] == "GREEN"):
+            return False
     return True
 
 if __name__ == "__main__":
-    # Use your existing signal timing plan
+    # Sample 4-phase plan: NS Green/Yellow, EW Green/Yellow
+    # User can set cycle_length here (e.g., 100s)
+    cycle_length = 100
+    # Distribute green times to match cycle length
+    base_greens = [30, 30]
+    base_yellows = [YELLOW_DURATION, YELLOW_DURATION]
+    total_base = sum(base_greens) + sum(base_yellows)
+    extra = cycle_length - total_base
+    # Distribute extra time proportionally to greens
+    greens = [g + extra * (g / sum(base_greens)) for g in base_greens]
     signal_timing = [
-        {'phase': 'East-West Through', 'duration': 34},
-        {'phase': 'East-West Through Yellow', 'duration': 3.8},
-        {'phase': 'East-West Through Red Clearance', 'duration': 2.2},
-        {'phase': 'North-South Left', 'duration': 5},
-        {'phase': 'North-South Left Yellow', 'duration': 3.6},
-        {'phase': 'North-South Left Red Clearance', 'duration': 1.2},
-        {'phase': 'North-South Through', 'duration': 34.5},
-        {'phase': 'North-South Through Yellow', 'duration': 3.6},
-        {'phase': 'North-South Through Red Clearance', 'duration': 1.9},
-        {'phase': 'East-West Left', 'duration': 5},
-        {'phase': 'East-West Left Yellow', 'duration': 3.8},
-        {'phase': 'East-West Left Red Clearance', 'duration': 1.2},
+        {'phase': 'North-South Through Green', 'duration': greens[0]},
+        {'phase': 'North-South Through Yellow', 'duration': YELLOW_DURATION},
+        {'phase': 'East-West Through Green', 'duration': greens[1]},
+        {'phase': 'East-West Through Yellow', 'duration': YELLOW_DURATION},
     ]
-    
-    # Average arrivals per second for each direction
     avg_arrivals = {
-            'north left': 0.3,  # vehicles per second
-            'north through': 0.3, 
-            'north right': .2,
-            'south left': 0.3,  # vehicles per second
-            'south through': 0.3, 
-            'south right': .2,
-            'east left': 0.3,  # vehicles per second
-            'east through': 0.3, 
-            'east right': .2,
-            'west left': 0.3,  # vehicles per second
-            'west through': 0.3, 
-            'west right': .2,   
+        'north left': 0.3, 'north through': 0.3, 'north right': .2,
+        'south left': 0.3, 'south through': 0.3, 'south right': .2,
+        'east left': 0.3, 'east through': 0.3, 'east right': .2,
+        'west left': 0.3, 'west through': 0.3, 'west right': .2,
     }
-    
-    # Current simulation time
-    with open('final_time.txt', 'r') as f:
-    # Read the first line of the file
-     line = f.readline().strip()  # Remove any extra spaces or newline characters
-    
-    # Extract the final time value from the line
-    # Assuming the line is formatted like: "Final Simulation Time for cutoff_frame 100: 12.34 seconds"
-    final_time_str = line.split(":")[1].strip().split()[0]  # Extract the value before 'seconds'
-    
-    # Convert the extracted value to a float and store it in the `current_time` variable
-    current_time = float(final_time_str)
-    print('Bus Enters Link:')
-    print(current_time)
-    # arrival time for the exhaustive search (absolute time)
-    arrival_time =  40 # (this will be fed in somehow)
-    
-    # Get details about when the bus will arrive at the intersection
-    phase_info = find_bus_phase(arrival_time - current_time, 
-                               create_signal_plan_from_current_time(
-                                   signal_timing, 
-                                   *get_current_phase(current_time, signal_timing), 
-                                   200))
-    
-    if not isinstance(phase_info, str):
-        phase_name, remaining_time, status = phase_info
-        print(f"Current simulation time: {current_time} seconds")
-        print(f"The bus will arrive at the {phase_name} phase with {remaining_time} seconds left ({status}).")
-        
-        # Check if TSP is needed
-        tsp_message = check_tsp_need(phase_name, remaining_time)
-        print(tsp_message)
-    
-    # Run the exhaustive search
+    arrival_time = 20
+    horizon = int(min(2 * cycle_length, 200))  # 2 cycles, capped at 200s
+
     tsp_plans = exhaustive_search_tsp(
-        signal_timing, 
-        arrival_time, 
-        current_time=current_time, 
-        max_extension=5, 
-        optimization_horizon=200,
+        signal_timing,
+        arrival_time,
+        current_time=0,
+        max_extension=MIN_GREEN,
+        optimization_horizon=horizon,
         avg_arrivals=avg_arrivals
     )
-    
-    # Display the results
-    print("\nExhaustive TSP Search Results:")
-    print("=" * 80)
-    
-    # Display baseline (no TSP) plan
-    baseline = next(plan for plan in tsp_plans if plan['type'] == 'No TSP')
-    print("\nBaseline (No TSP):")
-    print(f"Bus delay: {baseline['bus_delay']:.1f} seconds")
-    print(f"Person delay: {baseline['person_delay']:.1f} seconds")
-    
-    # Save the detailed timing plan to a file
-    import json
-    with open('baseline_timing_plan.json', 'w') as f:
-        json.dump(baseline['detailed_timing'], f, indent=2)
-    print(f"Baseline timing plan saved to 'baseline_timing_plan.json'")
-    
-    # Display top 5 plans
-    print("\nTop 5 TSP plans by bus delay:")
-    for i, plan in enumerate(tsp_plans[:6]):
-        if i == 0 and plan['type'] == 'No TSP':
-            # Skip the baseline plan in the top 5 if it's already the best
-            continue
-            
-        print("\n" + "-" * 80)
-        print(f"Plan {i+1}:")
-        print(f"Type: {plan['type']}")
-        
-        if plan['insertion_point'] is not None:
-            # Find which phase the insertion point is in
-            insertion_phase_info = find_insertion_phase(plan['insertion_point'], signal_timing)
-            if insertion_phase_info:
-                insertion_phase_index, time_within_phase = insertion_phase_info
-                insertion_phase = signal_timing[insertion_phase_index]['phase']
-                print(f"TSP inserted during: {insertion_phase}")
-                print(f"Insertion at second: {plan['insertion_point']} (within phase: {time_within_phase:.1f}s)")
-        
-        print(f"Extension: {plan['extension']} seconds")
-        print(f"Bus delay: {plan['bus_delay']:.1f} seconds")
-        print(f"Person delay: {plan['person_delay']:.1f} seconds")
-        
-        # Calculate improvement percentages
-        if baseline['bus_delay'] > 0:
-            bus_improvement = (baseline['bus_delay'] - plan['bus_delay']) / baseline['bus_delay'] * 100
-            print(f"Bus delay improvement: {bus_improvement:.1f}%")
-        
-        if baseline['person_delay'] > 0:
-            person_improvement = (baseline['person_delay'] - plan['person_delay']) / baseline['person_delay'] * 100
-            print(f"Person delay improvement: {person_improvement:.1f}%")
-        
-        # Save the detailed timing plan to a file
-        with open(f'tsp_plan_{i+1}_timing.json', 'w') as f:
-            json.dump(plan['detailed_timing'], f, indent=2)
-        print(f"Timing plan saved to 'tsp_plan_{i+1}_timing.json'")
-    
-    # Find and display the best plan that minimizes person delay
-    min_person_delay = min(plan['person_delay'] for plan in tsp_plans if plan['person_delay'] is not None)
-    best_person_plan = next(plan for plan in tsp_plans if plan['person_delay'] == min_person_delay)
-    
-    print("\n" + "=" * 80)
-    print("Best plan for minimizing total person delay:")
-    print(f"Type: {best_person_plan['type']}")
-    
-    if best_person_plan['insertion_point'] is not None:
-        # Find which phase the insertion point is in
-        insertion_phase_info = find_insertion_phase(best_person_plan['insertion_point'], signal_timing)
-        if insertion_phase_info:
-            insertion_phase_index, time_within_phase = insertion_phase_info
-            insertion_phase = signal_timing[insertion_phase_index]['phase']
-            print(f"TSP inserted during: {insertion_phase}")
-            print(f"Insertion at second: {best_person_plan['insertion_point']} (within phase: {time_within_phase:.1f}s)")
-    
-    print(f"Extension: {best_person_plan['extension']} seconds")
-    print(f"Bus delay: {best_person_plan['bus_delay']:.1f} seconds")
-    print(f"Person delay: {best_person_plan['person_delay']:.1f} seconds")
-    
-    # Calculate improvement percentages
-    if baseline['bus_delay'] > 0 and best_person_plan['bus_delay'] is not None:
-        bus_improvement = (baseline['bus_delay'] - best_person_plan['bus_delay']) / baseline['bus_delay'] * 100
-        print(f"Bus delay improvement: {bus_improvement:.1f}%")
-    
-    if baseline['person_delay'] > 0:
-        person_improvement = (baseline['person_delay'] - best_person_plan['person_delay']) / baseline['person_delay'] * 100
-        print(f"Person delay improvement: {person_improvement:.1f}%")
-    
-    # Save the best person plan to a file
-    with open('best_person_plan_timing.json', 'w') as f:
-        json.dump(best_person_plan['detailed_timing'], f, indent=2)
-    print(f"Best person plan saved to 'best_person_plan_timing.json'")
+    print("\nTop 10 valid TSP plans (bus_delay, person_delay):")
+    # Only output as many plans as exist, up to 10
+    num_plans = min(10, len(tsp_plans))
+    for i in range(num_plans):
+        plan = tsp_plans[i]
+        print(f"Plan {i+1}: Bus delay={plan['bus_delay']:.2f}, Person delay={plan['person_delay']:.2f}")
+        output_json = {
+            "summary": {
+                "bus_delay": plan['bus_delay'],
+                "person_delay": plan['person_delay'],
+                "insertion_point": plan['insertion_point'],
+                "extension": plan['extension'],
+                "type": plan['type']
+            },
+            "four_phase_plan": [
+                {
+                    "phase": p["phase"],
+                    "duration": p["duration"]
+                } for p in plan["plan"]
+            ],
+            "detailed_timing": plan["detailed_timing"]
+        }
+        with open(f"tsp_plan_{i+1}_timing.json", "w") as f:
+            json.dump(output_json, f, indent=2)
+    # For any remaining files up to 10, write a placeholder but do NOT overwrite existing valid plans
+    for i in range(num_plans, 10):
+        output_json = {
+            "summary": {
+                "bus_delay": None,
+                "person_delay": None,
+                "insertion_point": None,
+                "extension": None,
+                "type": None
+            },
+            "four_phase_plan": [],
+            "detailed_timing": {
+                "seconds": [],
+                "phase": [],
+                "directions": {
+                    "North-South-Left": [],
+                    "North-South-Through": [],
+                    "East-West-Left": [],
+                    "East-West-Through": []
+                }
+            }
+        }
+        with open(f"tsp_plan_{i+1}_timing.json", "w") as f:
+            json.dump(output_json, f, indent=2)
